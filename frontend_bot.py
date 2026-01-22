@@ -6,13 +6,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import ReplyKeyboardRemove
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties  # <-- ДОБАВЬТЕ ЭТОТ ИМПОРТ
 from database import db
 
 # --- Настройки ---
-BOT_TOKEN = "8457649746:AAFqlHpszZisrBS21VrMeJrknen6PHtNHHk"  # Замените на токен от @BotFather
-
-# --- Инициализация ---
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # --- Класс состояний FSM ---
