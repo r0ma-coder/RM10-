@@ -5,7 +5,6 @@ import os
 from telethon import TelegramClient, errors
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import Channel, ChatInviteExported
 from database import db
 
 # Настройка логирования
@@ -34,6 +33,7 @@ class ParserWorker:
         try:
             self.client = TelegramClient(self.session_file, API_ID, API_HASH)
             await self.client.connect()
+            logger.info("Подключение к Telegram установлено")
             
             if not await self.client.is_user_authorized():
                 logger.info("Сессия не авторизована. Запрашиваю код...")
@@ -53,121 +53,99 @@ class ParserWorker:
             logger.error(f"❌ Ошибка инициализации клиента: {e}")
             return False
     
-    async def join_chat(self, chat_link):
-        """Автоматическое вступление в чат/канал"""
+    async def join_chat_or_channel(self, chat_link):
+        """
+        Пытается вступить в чат или канал по ссылке.
+        Возвращает объект чата в случае успеха.
+        """
         try:
-            # Получаем сущность чата по ссылке
-            chat = await self.client.get_entity(chat_link)
-            chat_title = chat.title if hasattr(chat, 'title') else chat.username
+            logger.info(f"Пытаюсь вступить в: {chat_link}")
             
-            # Проверяем, является ли пользователь уже участником
+            # Пробуем вступить через удобный метод (работает для многих публичных чатов/каналов)
             try:
-                # Для каналов и супергрупп
-                if isinstance(chat, Channel):
-                    # Пытаемся получить информацию о канале
-                    full_chat = await self.client(GetFullChannelRequest(channel=chat))
-                    # Если мы участник, вернется информация
-                    logger.info(f"✅ Уже состою в канале: {chat_title}")
-                    return chat
-            except errors.ChannelPrivateError:
-                # Не участник канала - нужно вступить
-                pass
-            
-            logger.info(f"🔄 Пытаюсь вступить в: {chat_title}")
-            
-            # Вступаем в чат/канал
-            if hasattr(chat, 'username'):
-                # Публичный чат/канал по username
+                chat = await self.client.get_entity(chat_link)
                 await self.client(JoinChannelRequest(channel=chat))
-                logger.info(f"✅ Успешно вступил в публичный чат: {chat_title}")
-            elif hasattr(chat, 'megagroup') and chat.megagroup:
-                # Супергруппа
-                await self.client(JoinChannelRequest(channel=chat))
-                logger.info(f"✅ Успешно вступил в супергруппу: {chat_title}")
-            else:
-                # Обычный чат (может потребоваться инвайт-ссылка)
-                try:
-                    await self.client(JoinChannelRequest(channel=chat))
-                    logger.info(f"✅ Успешно вступил в чат: {chat_title}")
-                except errors.InviteHashEmptyError:
-                    logger.error(f"❌ Для чата {chat_title} требуется инвайт-ссылка")
-                    raise
-                except errors.InviteHashExpiredError:
-                    logger.error(f"❌ Инвайт-ссылка устарела для {chat_title}")
-                    raise
-                except errors.InviteHashInvalidError:
-                    logger.error(f"❌ Неверная инвайт-ссылка для {chat_title}")
-                    raise
-            
-            # Даем Telegram время обработать вступление
-            await asyncio.sleep(2)
-            return chat
-            
-        except errors.FloodWaitError as e:
-            logger.warning(f"⏳ FloodWait при вступлении! Ждем {e.seconds} секунд...")
-            await asyncio.sleep(e.seconds)
-            return await self.join_chat(chat_link)
+                logger.info(f"✅ Успешно вступил в: {chat.title if hasattr(chat, 'title') else chat_link}")
+                return chat
+            except (errors.UserAlreadyParticipantError, errors.ChannelPrivateError) as e:
+                # Если уже состоим или чат приватный, просто получаем объект чата
+                logger.info(f"Уже состою в чате или чат приватный. Продолжаю работу...")
+                return await self.client.get_entity(chat_link)
+            except errors.InviteHashEmptyError:
+                logger.warning("Ссылка-приглашение недействительна или устарела.")
+                return None
+            except errors.InviteHashExpiredError:
+                logger.warning("Срок действия ссылки-приглашения истек.")
+                return None
+            except errors.InviteRequestSentError:
+                logger.info("Заявка на вступление отправлена. Ожидаю подтверждения...")
+                return await self.client.get_entity(chat_link)
+                
         except Exception as e:
             logger.error(f"❌ Ошибка при вступлении в чат: {e}")
-            raise
+            return None
     
     async def get_active_users(self, chat, max_users=300, min_messages=2):
-        """Получает активных пользователей из чата"""
+        """
+        Основная функция парсинга активных пользователей.
+        """
         active_users = []
         
         try:
             # Получаем всех участников чата
-            logger.info(f"👥 Получаю список участников...")
+            logger.info("Получаю список участников...")
             all_participants = await self.client.get_participants(chat)
-            logger.info(f"📊 Всего участников: {len(all_participants)}")
+            logger.info(f"Всего участников: {len(all_participants)}")
             
-            if len(all_participants) == 0:
-                logger.warning("⚠️ В чате нет участников или нет доступа к списку")
-                return []
+            # Ограничиваем количество проверяемых пользователей
+            participants_to_check = all_participants[:max_users*2]  # Берем с запасом
             
-            # Фильтруем пользователей с username и проверяем активность
-            for i, user in enumerate(all_participants):
-                if len(active_users) >= max_users:
-                    break
-                
+            for i, user in enumerate(participants_to_check):
+                # Пропускаем пользователей без username
                 if not user.username:
                     continue
                 
+                # Проверяем количество сообщений пользователя
                 try:
-                    # Проверяем историю сообщений пользователя
-                    messages = await self.client.get_messages(
+                    # Получаем историю сообщений пользователя в этом чате
+                    user_messages = await self.client.get_messages(
                         chat, 
                         limit=50,  # Проверяем последние 50 сообщений
                         from_user=user
                     )
                     
-                    user_msg_count = len(messages)
+                    message_count = len(user_messages)
                     
-                    if user_msg_count >= min_messages:
+                    if message_count >= min_messages:
                         user_info = {
                             'id': user.id,
                             'username': user.username,
-                            'first_name': user.first_name,
-                            'last_name': user.last_name,
-                            'messages_count': user_msg_count
+                            'first_name': getattr(user, 'first_name', ''),
+                            'last_name': getattr(user, 'last_name', ''),
+                            'messages_count': message_count
                         }
                         active_users.append(user_info)
                         
-                        logger.info(f"✅ Активный: @{user.username} (сообщений: {user_msg_count})")
+                        logger.info(f"✅ Найден активный: @{user.username} ({message_count} сообщ.)")
+                        
+                        # Если достигли лимита - прерываем
+                        if len(active_users) >= max_users:
+                            logger.info(f"Достигнут лимит в {max_users} пользователей")
+                            break
                     
-                    # Пауза между запросами, чтобы избежать блокировки
-                    if i % 5 == 0:
+                    # Пауза между проверками пользователей для избежания блокировки
+                    if i % 10 == 0:
                         await asyncio.sleep(1)
                         
                 except Exception as e:
-                    logger.debug(f"⚠️ Ошибка при проверке пользователя {user.username}: {e}")
+                    logger.debug(f"Ошибка при проверке пользователя @{user.username}: {e}")
                     continue
             
-            logger.info(f"🎯 Найдено активных пользователей: {len(active_users)}")
+            logger.info(f"Парсинг завершен. Найдено активных пользователей: {len(active_users)}")
             return active_users
             
         except Exception as e:
-            logger.error(f"❌ Ошибка при получении пользователей: {e}")
+            logger.error(f"❌ Ошибка при парсинге пользователей: {e}")
             return []
     
     async def process_task(self, task):
@@ -179,18 +157,25 @@ class ParserWorker:
         logger.info(f"🔄 Начинаю обработку задачи #{task_id}: {chat_link}")
         
         try:
-            # Шаг 1: Вступаем в чат
-            chat = await self.join_chat(chat_link)
-            chat_title = chat.title if hasattr(chat, 'title') else chat.username
+            # 1. Вступаем в чат/канал
+            chat = await self.join_chat_or_channel(chat_link)
+            if not chat:
+                return {
+                    'success': False,
+                    'error': 'Не удалось вступить в чат/канал'
+                }
             
-            # Шаг 2: Получаем активных пользователей
+            chat_title = chat.title if hasattr(chat, 'title') else chat.username
+            logger.info(f"📁 Чат: {chat_title}")
+            
+            # 2. Парсим активных пользователей
             active_users = await self.get_active_users(chat, max_users, min_messages=2)
             
-            # Шаг 3: Сохраняем результаты
+            # 3. Сохраняем результаты
             filename = await self.save_results(active_users, chat_title)
             
             if active_users:
-                logger.info(f"✅ Задача #{task_id} завершена. Найдено: {len(active_users)}")
+                logger.info(f"✅ Задача #{task_id} завершена. Найдено активных: {len(active_users)}")
                 return {
                     'success': True,
                     'filename': filename,
@@ -206,26 +191,8 @@ class ParserWorker:
                     'chat_title': chat_title
                 }
                 
-        except errors.ChannelPrivateError:
-            logger.error(f"❌ Чат приватный: {chat_link}")
-            return {
-                'success': False,
-                'error': 'Чат приватный. Требуется приглашение.'
-            }
-        except errors.InviteHashEmptyError:
-            logger.error(f"❌ Требуется инвайт-ссылка: {chat_link}")
-            return {
-                'success': False,
-                'error': 'Для вступления требуется инвайт-ссылка.'
-            }
-        except errors.UsernameNotOccupiedError:
-            logger.error(f"❌ Чат не существует: {chat_link}")
-            return {
-                'success': False,
-                'error': 'Чат/канал не существует.'
-            }
         except errors.FloodWaitError as e:
-            logger.error(f"⏳ FloodWait: {e.seconds} секунд")
+            logger.error(f"⏳ FloodWaitError для задачи #{task_id}: {e.seconds} секунд")
             return {
                 'success': False,
                 'error': f'FloodWait: {e.seconds} секунд',
@@ -243,12 +210,10 @@ class ParserWorker:
         if not users:
             return None
         
-        # Создаем безопасное имя файла
         safe_title = "".join(c for c in chat_title if c.isalnum() or c in (' ', '-', '_')).rstrip()
         timestamp = int(time.time())
         filename = f"results/{safe_title}_{timestamp}.txt"
         
-        # Создаем папку results, если её нет
         os.makedirs("results", exist_ok=True)
         
         try:
@@ -258,7 +223,6 @@ class ParserWorker:
                 f.write(f"Время парсинга: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write("=" * 60 + "\n\n")
                 
-                # Сортируем по количеству сообщений
                 users_sorted = sorted(users, key=lambda x: x['messages_count'], reverse=True)
                 
                 for i, user in enumerate(users_sorted, 1):
@@ -280,20 +244,16 @@ class ParserWorker:
         
         while self.is_running:
             try:
-                # Получаем следующую задачу
                 task = db.get_pending_task()
                 
                 if task:
                     task_id = task['id']
                     logger.info(f"📋 Найдена задача #{task_id} для обработки")
                     
-                    # Обновляем статус задачи
                     db.update_task_status(task_id, 'processing')
                     
-                    # Обрабатываем задачу
                     result = await self.process_task(task)
                     
-                    # Обновляем статус в зависимости от результата
                     if result['success']:
                         if result.get('users_found', 0) > 0:
                             db.update_task_status(
@@ -310,7 +270,7 @@ class ParserWorker:
                                 result_filename=None,
                                 users_found=0
                             )
-                            logger.info(f"ℹ️ Задача #{task_id} завершена (нет активных пользователей)")
+                            logger.info(f"ℹ️ Задача #{task_id} завершена")
                     else:
                         error_msg = result.get('error', 'Unknown error')
                         db.update_task_status(
@@ -320,19 +280,16 @@ class ParserWorker:
                         )
                         logger.error(f"❌ Задача #{task_id} завершилась с ошибкой: {error_msg}")
                         
-                        # Если FloodWait, делаем паузу
                         if 'FloodWait' in error_msg:
                             wait_time = result.get('retry_after', 60)
                             logger.warning(f"⏳ Пауза {wait_time} секунд из-за FloodWait...")
                             await asyncio.sleep(wait_time)
                 else:
-                    # Нет задач - ждём
                     await asyncio.sleep(5)
                     
             except KeyboardInterrupt:
                 logger.info("🛑 Получен сигнал прерывания")
                 self.is_running = False
-                
             except Exception as e:
                 logger.error(f"❌ Критическая ошибка в основном цикле: {e}")
                 await asyncio.sleep(30)
@@ -353,9 +310,6 @@ class ParserWorker:
                 logger.info("📴 Соединение с Telegram закрыто")
         
         return True
-
-# Необходимый импорт
-from telethon.tl.functions.channels import GetFullChannelRequest
 
 # --- Запуск парсера ---
 async def main():
