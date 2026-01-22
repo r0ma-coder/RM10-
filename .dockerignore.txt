@@ -1,0 +1,10 @@
+*.pyc
+__pycache__/
+*.log
+*.session
+venv/
+env/
+.git/
+.DS_Store
+*.db
+results/*.txt
