@@ -1,2 +1,3 @@
-aiogram==3.0.0
-telethon==1.34.0
+# Основные зависимости
+aiogram==3.17.0
+telethon==1.42.0
